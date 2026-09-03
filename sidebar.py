@@ -125,7 +125,9 @@ class AssistDock(QDockWidget):
         row.addWidget(self.send_button)
         layout.addLayout(row)
         self._send_shortcuts = []
-        for sequence in ("Meta+Return", "Meta+Enter"):
+        # Qt uses Ctrl in portable shortcuts for the native Command key on macOS.
+        # On Windows/Linux, the same shortcuts naturally use Ctrl.
+        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
             shortcut = QShortcut(QKeySequence(sequence), page)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             shortcut.activated.connect(self.send_question)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 — 2026-09-03
+
+- Fix `⌘+Enter` question submission on macOS by using Qt's platform-portable Control mapping.
+
 ## 0.1.0 — 2026-09-03
 
 - Add a right-side AI assistant during Anki reviews.
