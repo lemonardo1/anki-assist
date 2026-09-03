@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+.DS_Store
+# Created by Anki for each local installation. May contain the API key.
+meta.json
+user_files/
