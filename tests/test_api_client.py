@@ -13,6 +13,12 @@ assert SPEC and SPEC.loader
 sys.modules[SPEC.name] = api_client
 SPEC.loader.exec_module(api_client)
 
+FORMATTING_SPEC = importlib.util.spec_from_file_location("formatting", ROOT / "formatting.py")
+formatting = importlib.util.module_from_spec(FORMATTING_SPEC)
+assert FORMATTING_SPEC and FORMATTING_SPEC.loader
+sys.modules[FORMATTING_SPEC.name] = formatting
+FORMATTING_SPEC.loader.exec_module(formatting)
+
 
 class FakeResponse:
     def __init__(self, body):
@@ -61,6 +67,12 @@ class ApiClientTests(unittest.TestCase):
         )
         self.assertEqual(summary, "정리")
         self.assertEqual(updates, {"Front": "새 값"})
+
+    def test_rich_text_escapes_html_and_formats_basic_markdown(self):
+        rendered = formatting.safe_rich_text('<script>x</script> **핵심** `CDK4/6`')
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("<b>핵심</b>", rendered)
+        self.assertIn("<code>CDK4/6</code>", rendered)
 
 
 if __name__ == "__main__":

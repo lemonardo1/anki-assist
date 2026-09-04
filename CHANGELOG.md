@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 — 2026-09-04
+
+- Handle the submit shortcut directly in question editors for more reliable keyboard input.
+- Support `⌘+Enter` in both question and card-edit prompts.
+- Add inline loading, completion, cancellation, and error status.
+- Restore question text after failed or cancelled requests.
+- Add a button to copy the latest AI answer.
+- Safely render basic bold and inline-code formatting in conversations.
+- Ignore stale background responses after cancellation or card changes.
+
 ## 0.1.1 — 2026-09-03
 
 - Fix `⌘+Enter` question submission on macOS by using Qt's platform-portable Control mapping.

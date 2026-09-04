@@ -10,15 +10,13 @@ from aqt import gui_hooks, mw
 from aqt.operations import CollectionOp
 from aqt.qt import (
     QAction,
+    QApplication,
     QComboBox,
     QDockWidget,
     QHBoxLayout,
-    QKeySequence,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
-    QShortcut,
     QStackedWidget,
     QTabWidget,
     QTextBrowser,
@@ -30,6 +28,8 @@ from aqt.qt import (
 
 from .api_client import OpenAIError, create_response, parse_edit_proposal
 from .dialogs import EditPreviewDialog, SettingsDialog, TemplateDialog
+from .formatting import safe_rich_text
+from .widgets import SubmitTextEdit
 
 
 ASK_INSTRUCTIONS = """당신은 Anki 학습 도우미입니다. 제공된 현재 카드만을 학습 문맥으로 사용하세요.
@@ -53,7 +53,13 @@ class AssistDock(QDockWidget):
         self.setMinimumWidth(340)
         self._card_id: int | None = None
         self._history: list[dict[str, str]] = []
+        self._conversation_started = False
+        self._last_answer = ""
         self._busy = False
+        self._request_serial = 0
+        self._status_serial = 0
+        self._request_future: Future | None = None
+        self._cancel_callback = None
         self._dialogs: list[QWidget] = []
         self.setWidget(self._build_ui())
         mw.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self)
@@ -88,6 +94,18 @@ class AssistDock(QDockWidget):
         self.tabs.addTab(self._build_ask_tab(), "후속 질문")
         self.tabs.addTab(self._build_edit_tab(), "카드 수정")
         outer.addWidget(self.tabs, 1)
+
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        self.cancel_button = QPushButton("요청 취소")
+        self.cancel_button.clicked.connect(self.cancel_request)
+        self.cancel_button.hide()
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.cancel_button)
+        outer.addLayout(status_row)
         return root
 
     def _build_ask_tab(self) -> QWidget:
@@ -98,7 +116,7 @@ class AssistDock(QDockWidget):
         layout.addWidget(self.ask_templates)
 
         self.ask_stack = QStackedWidget()
-        self.initial_question = QPlainTextEdit()
+        self.initial_question = SubmitTextEdit()
         self.initial_question.setPlaceholderText(
             "현재 카드에 관해 질문을 바로 입력하세요.\n\n⌘+Enter로 전송"
         )
@@ -109,7 +127,7 @@ class AssistDock(QDockWidget):
         self.ask_stack.addWidget(self.transcript)
         layout.addWidget(self.ask_stack, 1)
 
-        self.question = QPlainTextEdit()
+        self.question = SubmitTextEdit()
         self.question.setPlaceholderText("후속 질문 입력…  (⌘+Enter로 전송)")
         self.question.setMaximumHeight(105)
         self.question.hide()
@@ -117,21 +135,19 @@ class AssistDock(QDockWidget):
         row = QHBoxLayout()
         clear = QPushButton("대화 지우기")
         clear.clicked.connect(self.clear_chat)
+        self.copy_button = QPushButton("답변 복사")
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy_last_answer)
         self.send_button = QPushButton("질문 보내기")
         self.send_button.setToolTip("질문 보내기 (⌘+Enter)")
         self.send_button.clicked.connect(self.send_question)
         row.addWidget(clear)
+        row.addWidget(self.copy_button)
         row.addStretch(1)
         row.addWidget(self.send_button)
         layout.addLayout(row)
-        self._send_shortcuts = []
-        # Qt uses Ctrl in portable shortcuts for the native Command key on macOS.
-        # On Windows/Linux, the same shortcuts naturally use Ctrl.
-        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
-            shortcut = QShortcut(QKeySequence(sequence), page)
-            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(self.send_question)
-            self._send_shortcuts.append(shortcut)
+        self.initial_question.submit_requested.connect(self.send_question)
+        self.question.submit_requested.connect(self.send_question)
         return page
 
     def _build_edit_tab(self) -> QWidget:
@@ -143,8 +159,9 @@ class AssistDock(QDockWidget):
         self.edit_templates = QComboBox()
         self.edit_templates.currentIndexChanged.connect(self._select_edit_template)
         layout.addWidget(self.edit_templates)
-        self.edit_prompt = QPlainTextEdit()
-        self.edit_prompt.setPlaceholderText("어떻게 수정할지 입력…")
+        self.edit_prompt = SubmitTextEdit()
+        self.edit_prompt.setPlaceholderText("어떻게 수정할지 입력…  (⌘+Enter로 생성)")
+        self.edit_prompt.submit_requested.connect(self.request_edit)
         layout.addWidget(self.edit_prompt, 1)
         self.edit_button = QPushButton("수정안 만들기")
         self.edit_button.clicked.connect(self.request_edit)
@@ -177,7 +194,7 @@ class AssistDock(QDockWidget):
     def _select_ask_template(self, index: int) -> None:
         prompt = self.ask_templates.itemData(index)
         if prompt:
-            editor = self.question if self._history else self.initial_question
+            editor = self.question if self._conversation_started else self.initial_question
             editor.setPlainText(prompt)
             editor.setFocus()
 
@@ -205,16 +222,21 @@ class AssistDock(QDockWidget):
             self.setVisible(new_state == "review")
 
     def clear_chat(self) -> None:
+        if self._busy:
+            self.cancel_request()
         self._history.clear()
+        self._conversation_started = False
+        self._last_answer = ""
         self.transcript.clear()
         self.initial_question.clear()
         self.question.clear()
         self.question.hide()
         self.ask_stack.setCurrentWidget(self.initial_question)
         self.ask_templates.setCurrentIndex(0)
+        self.copy_button.setEnabled(False)
 
     def send_question(self) -> None:
-        editor = self.question if self._history else self.initial_question
+        editor = self.question if self._conversation_started else self.initial_question
         prompt = editor.toPlainText().strip()
         if not prompt or not self._ensure_ready():
             return
@@ -225,7 +247,7 @@ class AssistDock(QDockWidget):
         ]
         input_items.extend(history)
         input_items.append({"role": "user", "content": prompt})
-        self._history.append({"role": "user", "content": prompt})
+        self._conversation_started = True
         self.ask_stack.setCurrentWidget(self.transcript)
         self.question.show()
         self._append_message("나", prompt, "#3b82f6")
@@ -235,14 +257,36 @@ class AssistDock(QDockWidget):
         self._run_request(
             instructions=ASK_INSTRUCTIONS,
             input_items=input_items,
-            on_success=lambda text: self._question_done(request_card_id, text),
+            status="답변 생성 중…",
+            on_success=lambda text: self._question_done(request_card_id, prompt, text),
+            on_error=lambda message: self._question_failed(request_card_id, prompt, message),
+            on_cancel=lambda: self._restore_question(request_card_id, prompt),
         )
 
-    def _question_done(self, request_card_id: int | None, text: str) -> None:
+    def _question_done(self, request_card_id: int | None, prompt: str, text: str) -> None:
         if request_card_id != self._card_id:
             return
+        self._history.append({"role": "user", "content": prompt})
         self._history.append({"role": "assistant", "content": text})
+        self._last_answer = text
+        self.copy_button.setEnabled(True)
         self._append_message("AI", text, "#10b981")
+        self._set_status("답변 완료", error=False, temporary=True)
+
+    def _question_failed(self, request_card_id: int | None, prompt: str, message: str) -> None:
+        self._restore_question(request_card_id, prompt)
+        self._append_message("오류", message, "#ef4444")
+        self._set_status(message, error=True)
+
+    def _restore_question(self, request_card_id: int | None, prompt: str) -> None:
+        if request_card_id == self._card_id and not self.question.toPlainText().strip():
+            self.question.setPlainText(prompt)
+            self.question.setFocus()
+
+    def copy_last_answer(self) -> None:
+        if self._last_answer:
+            QApplication.clipboard().setText(self._last_answer)
+            self._set_status("마지막 AI 답변을 복사했습니다.", temporary=True)
 
     def request_edit(self) -> None:
         prompt = self.edit_prompt.toPlainText().strip()
@@ -258,7 +302,9 @@ class AssistDock(QDockWidget):
         self._run_request(
             instructions=EDIT_INSTRUCTIONS,
             input_items=input_items,
+            status="수정안 생성 중…",
             on_success=lambda text: self._edit_done(request_card_id, text),
+            on_error=lambda message: self._set_status(message, error=True),
         )
 
     def _edit_done(self, request_card_id: int | None, text: str) -> None:
@@ -277,6 +323,7 @@ class AssistDock(QDockWidget):
         dialog = EditPreviewDialog(self, summary, original, updates, self._apply_updates)
         self._keep_dialog(dialog)
         dialog.show()
+        self._set_status("수정안을 만들었습니다. 내용을 검토해 주세요.", temporary=True)
 
     def _apply_updates(self, updates: dict[str, str]) -> None:
         note = self._current_note()
@@ -298,15 +345,28 @@ class AssistDock(QDockWidget):
                 # state such as timer_started and breaks the next answer action.
                 mw.reviewer._redraw_current_card()
             QMessageBox.information(self, "Anki Assist", "카드 수정이 적용되었습니다. 실행 취소할 수 있습니다.")
+            self._set_status("카드 수정이 적용되었습니다.", temporary=True)
 
         CollectionOp(parent=self, op=op).success(success).run_in_background()
 
-    def _run_request(self, *, instructions: str, input_items: list[dict], on_success) -> None:
+    def _run_request(
+        self,
+        *,
+        instructions: str,
+        input_items: list[dict],
+        status: str,
+        on_success,
+        on_error,
+        on_cancel=None,
+    ) -> None:
         config = self.config()
         api_key = os.environ.get("OPENAI_API_KEY", "").strip() or str(config.get("api_key", "")).strip()
         model = str(config.get("model", "gpt-5-mini"))
         max_tokens = int(config.get("max_output_tokens", 1800))
-        self._set_busy(True)
+        self._request_serial += 1
+        request_serial = self._request_serial
+        self._cancel_callback = on_cancel
+        self._set_busy(True, status)
 
         def task():
             return create_response(
@@ -318,15 +378,35 @@ class AssistDock(QDockWidget):
             )
 
         def done(future: Future) -> None:
+            if request_serial != self._request_serial:
+                return
+            self._request_future = None
+            self._cancel_callback = None
             self._set_busy(False)
             try:
                 result = future.result()
             except Exception as error:
-                self._show_error(str(error))
+                on_error(str(error))
                 return
             on_success(result.text)
 
-        mw.taskman.run_in_background(task, done, uses_collection=False)
+        self._request_future = mw.taskman.run_in_background(
+            task, done, uses_collection=False
+        )
+
+    def cancel_request(self) -> None:
+        if not self._busy:
+            return
+        self._request_serial += 1
+        if self._request_future:
+            self._request_future.cancel()
+        callback = self._cancel_callback
+        self._request_future = None
+        self._cancel_callback = None
+        self._set_busy(False)
+        if callback:
+            callback()
+        self._set_status("요청을 취소했습니다.", temporary=True)
 
     def _ensure_ready(self) -> bool:
         if self._busy:
@@ -358,15 +438,35 @@ class AssistDock(QDockWidget):
             "fields": {name: note[name] for name in note.keys()},
         }
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, status: str = "") -> None:
         self._busy = busy
         self.send_button.setEnabled(not busy)
         self.edit_button.setEnabled(not busy)
         self.send_button.setText("답변 생성 중…" if busy else "질문 보내기")
         self.edit_button.setText("수정안 생성 중…" if busy else "수정안 만들기")
+        self.cancel_button.setVisible(busy)
+        if busy:
+            self._set_status(status)
+
+    def _set_status(self, message: str, *, error: bool = False, temporary: bool = False) -> None:
+        self._status_serial += 1
+        status_serial = self._status_serial
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(
+            "color: #ef4444; padding: 3px;" if error else "color: palette(mid); padding: 3px;"
+        )
+        self.status_label.setVisible(bool(message))
+        if temporary and message:
+            def clear_if_current() -> None:
+                if status_serial == self._status_serial and not self._busy:
+                    self.status_label.hide()
+
+            from aqt.qt import QTimer
+
+            QTimer.singleShot(2500, clear_if_current)
 
     def _append_message(self, speaker: str, text: str, color: str) -> None:
-        safe = html.escape(text).replace("\n", "<br>")
+        safe = safe_rich_text(text)
         self.transcript.append(
             f'<div style="margin:8px 0"><b style="color:{color}">{speaker}</b><br>{safe}</div>'
         )
