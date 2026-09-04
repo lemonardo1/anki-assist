@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import json
 import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import Future
 from typing import Any
 
@@ -26,7 +28,13 @@ from aqt.qt import (
     Qt,
 )
 
-from .api_client import OpenAIError, create_response, parse_edit_proposal
+from .api_client import (
+    OpenAIError,
+    ResponseResult,
+    create_response,
+    create_streaming_response,
+    parse_edit_proposal,
+)
 from .dialogs import EditPreviewDialog, SettingsDialog, TemplateDialog
 from .formatting import safe_rich_text
 from .widgets import SubmitTextEdit
@@ -53,12 +61,16 @@ class AssistDock(QDockWidget):
         self.setMinimumWidth(340)
         self._card_id: int | None = None
         self._history: list[dict[str, str]] = []
+        self._display_messages: list[dict[str, str]] = []
+        self._sessions: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._conversation_started = False
         self._last_answer = ""
+        self._last_question = ""
         self._busy = False
         self._request_serial = 0
         self._status_serial = 0
         self._request_future: Future | None = None
+        self._cancel_event: threading.Event | None = None
         self._cancel_callback = None
         self._dialogs: list[QWidget] = []
         self.setWidget(self._build_ui())
@@ -133,16 +145,24 @@ class AssistDock(QDockWidget):
         self.question.hide()
         layout.addWidget(self.question)
         row = QHBoxLayout()
-        clear = QPushButton("대화 지우기")
+        clear = QToolButton()
+        clear.setText("대화 지우기")
         clear.clicked.connect(self.clear_chat)
-        self.copy_button = QPushButton("답변 복사")
+        self.copy_button = QToolButton()
+        self.copy_button.setText("답변 복사")
         self.copy_button.setEnabled(False)
         self.copy_button.clicked.connect(self.copy_last_answer)
+        self.retry_button = QToolButton()
+        self.retry_button.setText("재시도")
+        self.retry_button.setToolTip("마지막 질문 다시 보내기")
+        self.retry_button.setEnabled(False)
+        self.retry_button.clicked.connect(self.retry_last_question)
         self.send_button = QPushButton("질문 보내기")
         self.send_button.setToolTip("질문 보내기 (⌘+Enter)")
         self.send_button.clicked.connect(self.send_question)
         row.addWidget(clear)
         row.addWidget(self.copy_button)
+        row.addWidget(self.retry_button)
         row.addStretch(1)
         row.addWidget(self.send_button)
         layout.addLayout(row)
@@ -206,8 +226,11 @@ class AssistDock(QDockWidget):
     def on_card(self, card: Any) -> None:
         new_id = int(card.id)
         if new_id != self._card_id:
+            if self._busy:
+                self.cancel_request()
+            self._save_current_session()
             self._card_id = new_id
-            self.clear_chat()
+            self._load_session(new_id)
         note = card.note()
         names = list(note.keys())
         preview = " · ".join(
@@ -224,16 +247,65 @@ class AssistDock(QDockWidget):
     def clear_chat(self) -> None:
         if self._busy:
             self.cancel_request()
+        if self._card_id is not None:
+            self._sessions.pop(self._card_id, None)
         self._history.clear()
+        self._display_messages.clear()
         self._conversation_started = False
         self._last_answer = ""
-        self.transcript.clear()
+        self._last_question = ""
+        self._render_transcript()
         self.initial_question.clear()
         self.question.clear()
         self.question.hide()
         self.ask_stack.setCurrentWidget(self.initial_question)
         self.ask_templates.setCurrentIndex(0)
         self.copy_button.setEnabled(False)
+        self.retry_button.setEnabled(False)
+
+    def _save_current_session(self) -> None:
+        if self._card_id is None or not self._conversation_started:
+            return
+        self._sessions[self._card_id] = {
+            "history": [dict(item) for item in self._history],
+            "display": [dict(item) for item in self._display_messages],
+            "last_answer": self._last_answer,
+            "last_question": self._last_question,
+            "draft": self.question.toPlainText(),
+        }
+        self._sessions.move_to_end(self._card_id)
+        while len(self._sessions) > 20:
+            self._sessions.popitem(last=False)
+
+    def _load_session(self, card_id: int) -> None:
+        session = self._sessions.get(card_id)
+        self.initial_question.clear()
+        self.question.clear()
+        self.ask_templates.setCurrentIndex(0)
+        if not session:
+            self._history = []
+            self._display_messages = []
+            self._conversation_started = False
+            self._last_answer = ""
+            self._last_question = ""
+            self.ask_stack.setCurrentWidget(self.initial_question)
+            self.question.hide()
+            self.copy_button.setEnabled(False)
+            self.retry_button.setEnabled(False)
+            self._render_transcript()
+            return
+        self._sessions.move_to_end(card_id)
+        self._history = [dict(item) for item in session.get("history", [])]
+        self._display_messages = [dict(item) for item in session.get("display", [])]
+        self._conversation_started = True
+        self._last_answer = str(session.get("last_answer", ""))
+        self._last_question = str(session.get("last_question", ""))
+        self.question.setPlainText(str(session.get("draft", "")))
+        self.ask_stack.setCurrentWidget(self.transcript)
+        self.question.show()
+        self.copy_button.setEnabled(bool(self._last_answer))
+        self.retry_button.setEnabled(bool(self._last_question))
+        self._render_transcript()
 
     def send_question(self) -> None:
         editor = self.question if self._conversation_started else self.initial_question
@@ -247,10 +319,12 @@ class AssistDock(QDockWidget):
         ]
         input_items.extend(history)
         input_items.append({"role": "user", "content": prompt})
+        self._last_question = prompt
         self._conversation_started = True
         self.ask_stack.setCurrentWidget(self.transcript)
         self.question.show()
         self._append_message("나", prompt, "#3b82f6")
+        assistant_index = self._append_message("AI", "답변을 시작하는 중…", "#10b981")
         editor.clear()
         self.question.setFocus()
         request_card_id = self._card_id
@@ -258,25 +332,66 @@ class AssistDock(QDockWidget):
             instructions=ASK_INSTRUCTIONS,
             input_items=input_items,
             status="답변 생성 중…",
-            on_success=lambda text: self._question_done(request_card_id, prompt, text),
-            on_error=lambda message: self._question_failed(request_card_id, prompt, message),
-            on_cancel=lambda: self._restore_question(request_card_id, prompt),
+            stream=True,
+            on_delta=lambda delta: self._question_delta(
+                request_card_id, assistant_index, delta
+            ),
+            on_success=lambda result: self._question_done(
+                request_card_id, assistant_index, prompt, result
+            ),
+            on_error=lambda message: self._question_failed(
+                request_card_id, assistant_index, prompt, message
+            ),
+            on_cancel=lambda: self._question_cancelled(
+                request_card_id, assistant_index, prompt
+            ),
         )
 
-    def _question_done(self, request_card_id: int | None, prompt: str, text: str) -> None:
+    def _question_delta(
+        self, request_card_id: int | None, message_index: int, delta: str
+    ) -> None:
+        if request_card_id != self._card_id:
+            return
+        current = self._display_messages[message_index]["text"]
+        if current == "답변을 시작하는 중…":
+            current = ""
+        self._update_message(message_index, current + delta)
+
+    def _question_done(
+        self,
+        request_card_id: int | None,
+        message_index: int,
+        prompt: str,
+        result: ResponseResult,
+    ) -> None:
         if request_card_id != self._card_id:
             return
         self._history.append({"role": "user", "content": prompt})
-        self._history.append({"role": "assistant", "content": text})
-        self._last_answer = text
+        self._history.append({"role": "assistant", "content": result.text})
+        self._last_answer = result.text
         self.copy_button.setEnabled(True)
-        self._append_message("AI", text, "#10b981")
-        self._set_status("답변 완료", error=False, temporary=True)
+        self._update_message(message_index, result.text)
+        usage = f" · {result.total_tokens:,} 토큰" if result.total_tokens else ""
+        self._set_status(f"답변 완료{usage}", error=False, temporary=True)
 
-    def _question_failed(self, request_card_id: int | None, prompt: str, message: str) -> None:
+    def _question_failed(
+        self,
+        request_card_id: int | None,
+        message_index: int,
+        prompt: str,
+        message: str,
+    ) -> None:
         self._restore_question(request_card_id, prompt)
-        self._append_message("오류", message, "#ef4444")
+        if request_card_id == self._card_id:
+            self._update_message(message_index, f"오류: {message}", speaker="오류", color="#ef4444")
         self._set_status(message, error=True)
+
+    def _question_cancelled(
+        self, request_card_id: int | None, message_index: int, prompt: str
+    ) -> None:
+        self._restore_question(request_card_id, prompt)
+        if request_card_id == self._card_id:
+            self._update_message(message_index, "응답 생성을 취소했습니다.", color="#9ca3af")
 
     def _restore_question(self, request_card_id: int | None, prompt: str) -> None:
         if request_card_id == self._card_id and not self.question.toPlainText().strip():
@@ -287,6 +402,20 @@ class AssistDock(QDockWidget):
         if self._last_answer:
             QApplication.clipboard().setText(self._last_answer)
             self._set_status("마지막 AI 답변을 복사했습니다.", temporary=True)
+
+    def retry_last_question(self) -> None:
+        if not self._last_question or self._busy:
+            return
+        if (
+            len(self._history) >= 2
+            and self._history[-2].get("role") == "user"
+            and self._history[-2].get("content") == self._last_question
+            and self._history[-1].get("role") == "assistant"
+        ):
+            self._history = self._history[:-2]
+        editor = self.question if self._conversation_started else self.initial_question
+        editor.setPlainText(self._last_question)
+        self.send_question()
 
     def request_edit(self) -> None:
         prompt = self.edit_prompt.toPlainText().strip()
@@ -303,7 +432,8 @@ class AssistDock(QDockWidget):
             instructions=EDIT_INSTRUCTIONS,
             input_items=input_items,
             status="수정안 생성 중…",
-            on_success=lambda text: self._edit_done(request_card_id, text),
+            stream=False,
+            on_success=lambda result: self._edit_done(request_card_id, result.text),
             on_error=lambda message: self._set_status(message, error=True),
         )
 
@@ -355,8 +485,10 @@ class AssistDock(QDockWidget):
         instructions: str,
         input_items: list[dict],
         status: str,
+        stream: bool,
         on_success,
         on_error,
+        on_delta=None,
         on_cancel=None,
     ) -> None:
         config = self.config()
@@ -366,9 +498,23 @@ class AssistDock(QDockWidget):
         self._request_serial += 1
         request_serial = self._request_serial
         self._cancel_callback = on_cancel
+        cancel_event = threading.Event()
+        self._cancel_event = cancel_event
         self._set_busy(True, status)
 
         def task():
+            if stream:
+                return create_streaming_response(
+                    api_key=api_key,
+                    model=model,
+                    instructions=instructions,
+                    input_items=input_items,
+                    max_output_tokens=max_tokens,
+                    cancel_event=cancel_event,
+                    on_delta=lambda delta: mw.taskman.run_on_main(
+                        lambda: self._deliver_delta(request_serial, on_delta, delta)
+                    ),
+                )
             return create_response(
                 api_key=api_key,
                 model=model,
@@ -381,6 +527,7 @@ class AssistDock(QDockWidget):
             if request_serial != self._request_serial:
                 return
             self._request_future = None
+            self._cancel_event = None
             self._cancel_callback = None
             self._set_busy(False)
             try:
@@ -388,20 +535,27 @@ class AssistDock(QDockWidget):
             except Exception as error:
                 on_error(str(error))
                 return
-            on_success(result.text)
+            on_success(result)
 
         self._request_future = mw.taskman.run_in_background(
             task, done, uses_collection=False
         )
 
+    def _deliver_delta(self, request_serial: int, on_delta, delta: str) -> None:
+        if request_serial == self._request_serial and on_delta:
+            on_delta(delta)
+
     def cancel_request(self) -> None:
         if not self._busy:
             return
         self._request_serial += 1
+        if self._cancel_event:
+            self._cancel_event.set()
         if self._request_future:
             self._request_future.cancel()
         callback = self._cancel_callback
         self._request_future = None
+        self._cancel_event = None
         self._cancel_callback = None
         self._set_busy(False)
         if callback:
@@ -442,6 +596,7 @@ class AssistDock(QDockWidget):
         self._busy = busy
         self.send_button.setEnabled(not busy)
         self.edit_button.setEnabled(not busy)
+        self.retry_button.setEnabled(not busy and bool(self._last_question))
         self.send_button.setText("답변 생성 중…" if busy else "질문 보내기")
         self.edit_button.setText("수정안 생성 중…" if busy else "수정안 만들기")
         self.cancel_button.setVisible(busy)
@@ -465,11 +620,41 @@ class AssistDock(QDockWidget):
 
             QTimer.singleShot(2500, clear_if_current)
 
-    def _append_message(self, speaker: str, text: str, color: str) -> None:
-        safe = safe_rich_text(text)
-        self.transcript.append(
-            f'<div style="margin:8px 0"><b style="color:{color}">{speaker}</b><br>{safe}</div>'
+    def _append_message(self, speaker: str, text: str, color: str) -> int:
+        self._display_messages.append(
+            {"speaker": speaker, "text": text, "color": color}
         )
+        self._render_transcript()
+        return len(self._display_messages) - 1
+
+    def _update_message(
+        self,
+        index: int,
+        text: str,
+        *,
+        speaker: str | None = None,
+        color: str | None = None,
+    ) -> None:
+        if not 0 <= index < len(self._display_messages):
+            return
+        message = self._display_messages[index]
+        message["text"] = text
+        if speaker is not None:
+            message["speaker"] = speaker
+        if color is not None:
+            message["color"] = color
+        self._render_transcript()
+
+    def _render_transcript(self) -> None:
+        blocks = []
+        for message in self._display_messages:
+            speaker = html.escape(message.get("speaker", ""))
+            color = html.escape(message.get("color", "#9ca3af"), quote=True)
+            body = safe_rich_text(message.get("text", ""))
+            blocks.append(
+                f'<div style="margin:8px 0"><b style="color:{color}">{speaker}</b><br>{body}</div>'
+            )
+        self.transcript.setHtml("".join(blocks))
         bar = self.transcript.verticalScrollBar()
         bar.setValue(bar.maximum())
 

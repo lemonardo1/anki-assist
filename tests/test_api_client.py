@@ -2,6 +2,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -34,6 +35,22 @@ class FakeResponse:
         return self.body
 
 
+class FakeStreamResponse:
+    def __init__(self, events):
+        self.lines = []
+        for event in events:
+            self.lines.extend([f"data: {json.dumps(event)}\n".encode(), b"\n"])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
 class ApiClientTests(unittest.TestCase):
     def test_extracts_nested_output_text(self):
         body = {
@@ -59,6 +76,57 @@ class ApiClientTests(unittest.TestCase):
         sent = json.loads(urlopen.call_args.args[0].data)
         self.assertFalse(sent["store"])
         self.assertEqual(result.text, "답")
+
+    def test_streams_deltas_and_returns_usage(self):
+        events = [
+            {"type": "response.output_text.delta", "delta": "안"},
+            {"type": "response.output_text.delta", "delta": "녕"},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_2",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                },
+            },
+        ]
+        deltas = []
+        with patch.object(
+            api_client.urllib.request,
+            "urlopen",
+            return_value=FakeStreamResponse(events),
+        ) as urlopen:
+            result = api_client.create_streaming_response(
+                api_key="secret",
+                model="gpt-test",
+                instructions="help",
+                input_items=[{"role": "user", "content": "question"}],
+                on_delta=deltas.append,
+            )
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertTrue(sent["stream"])
+        self.assertFalse(sent["store"])
+        self.assertEqual(deltas, ["안", "녕"])
+        self.assertEqual(result.text, "안녕")
+        self.assertEqual(result.total_tokens, 12)
+
+    def test_stream_can_be_cancelled(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        events = [{"type": "response.output_text.delta", "delta": "ignored"}]
+        with patch.object(
+            api_client.urllib.request,
+            "urlopen",
+            return_value=FakeStreamResponse(events),
+        ):
+            with self.assertRaises(api_client.ResponseCancelled):
+                api_client.create_streaming_response(
+                    api_key="secret",
+                    model="gpt-test",
+                    instructions="help",
+                    input_items=[],
+                    on_delta=lambda _delta: None,
+                    cancel_event=cancelled,
+                )
 
     def test_parses_fenced_edit_json_and_filters_unknown_fields(self):
         summary, updates = api_client.parse_edit_proposal(

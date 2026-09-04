@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-09-04
+
+- Stream follow-up answers into the conversation as they are generated.
+- Cancel active streams with a cooperative network cancellation signal.
+- Show total token usage when a response finishes.
+- Keep up to 20 card conversations and drafts available while the review session remains open.
+- Retry the latest question without duplicating its previous answer in model context.
+
 ## 0.2.0 — 2026-09-04
 
 - Handle the submit shortcut directly in question editors for more reliable keyboard input.

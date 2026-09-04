@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Iterable
 
 
 API_URL = "https://api.openai.com/v1/responses"
@@ -14,10 +15,22 @@ class OpenAIError(RuntimeError):
     pass
 
 
+class ResponseCancelled(OpenAIError):
+    pass
+
+
 @dataclass(frozen=True)
 class ResponseResult:
     text: str
     response_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    @property
+    def total_tokens(self) -> int | None:
+        if self.input_tokens is None and self.output_tokens is None:
+            return None
+        return (self.input_tokens or 0) + (self.output_tokens or 0)
 
 
 def create_response(
@@ -34,21 +47,13 @@ def create_response(
     if not model.strip():
         raise OpenAIError("모델 이름이 비어 있습니다.")
 
-    payload = {
-        "model": model.strip(),
-        "instructions": instructions,
-        "input": input_items,
-        "max_output_tokens": max_output_tokens,
-        "store": False,
-    }
-    request = urllib.request.Request(
-        API_URL,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+    request = _request(
+        api_key=api_key,
+        model=model,
+        instructions=instructions,
+        input_items=input_items,
+        max_output_tokens=max_output_tokens,
+        stream=False,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -64,7 +69,143 @@ def create_response(
     text = extract_output_text(body)
     if not text:
         raise OpenAIError("OpenAI가 빈 응답을 반환했습니다.")
-    return ResponseResult(text=text, response_id=body.get("id"))
+    return _result_from_body(body, text)
+
+
+def create_streaming_response(
+    *,
+    api_key: str,
+    model: str,
+    instructions: str,
+    input_items: list[dict[str, Any]],
+    on_delta: Callable[[str], None],
+    cancel_event: threading.Event | None = None,
+    max_output_tokens: int = 1800,
+    timeout: int = 90,
+) -> ResponseResult:
+    if not api_key.strip():
+        raise OpenAIError("OpenAI API 키가 설정되지 않았습니다.")
+    if not model.strip():
+        raise OpenAIError("모델 이름이 비어 있습니다.")
+
+    request = _request(
+        api_key=api_key,
+        model=model,
+        instructions=instructions,
+        input_items=input_items,
+        max_output_tokens=max_output_tokens,
+        stream=True,
+    )
+    cancel_event = cancel_event or threading.Event()
+    chunks: list[str] = []
+    completed: dict[str, Any] | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for event in iter_sse_events(response):
+                if cancel_event.is_set():
+                    raise ResponseCancelled("요청이 취소되었습니다.")
+                event_type = event.get("type")
+                if event_type == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        chunks.append(delta)
+                        on_delta(delta)
+                elif event_type == "response.completed":
+                    response_body = event.get("response")
+                    if isinstance(response_body, dict):
+                        completed = response_body
+                elif event_type == "response.failed":
+                    response_body = event.get("response", {})
+                    error = response_body.get("error", {}) if isinstance(response_body, dict) else {}
+                    message = error.get("message") if isinstance(error, dict) else None
+                    raise OpenAIError(str(message or "OpenAI 응답 생성에 실패했습니다."))
+    except urllib.error.HTTPError as error:
+        detail = _http_error_message(error)
+        raise OpenAIError(f"OpenAI API 오류 ({error.code}): {detail}") from error
+    except urllib.error.URLError as error:
+        raise OpenAIError(f"네트워크 연결에 실패했습니다: {error.reason}") from error
+    except UnicodeDecodeError as error:
+        raise OpenAIError("OpenAI 스트림을 읽지 못했습니다.") from error
+
+    if cancel_event.is_set():
+        raise ResponseCancelled("요청이 취소되었습니다.")
+    if completed is None:
+        raise OpenAIError("OpenAI 스트림이 완료 이벤트 없이 종료되었습니다.")
+    text = "".join(chunks).strip() or extract_output_text(completed)
+    if not text:
+        raise OpenAIError("OpenAI가 빈 응답을 반환했습니다.")
+    return _result_from_body(completed, text)
+
+
+def iter_sse_events(lines: Iterable[bytes]) -> Iterable[dict[str, Any]]:
+    data_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.decode("utf-8").rstrip("\r\n")
+        if line == "":
+            if data_lines:
+                payload = "\n".join(data_lines)
+                data_lines.clear()
+                if payload != "[DONE]":
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError as error:
+                        raise OpenAIError("OpenAI 스트림 이벤트를 해석하지 못했습니다.") from error
+                    if isinstance(event, dict):
+                        yield event
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:
+        payload = "\n".join(data_lines)
+        if payload != "[DONE]":
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError as error:
+                raise OpenAIError("OpenAI 스트림 이벤트를 해석하지 못했습니다.") from error
+            if isinstance(event, dict):
+                yield event
+
+
+def _request(
+    *,
+    api_key: str,
+    model: str,
+    instructions: str,
+    input_items: list[dict[str, Any]],
+    max_output_tokens: int,
+    stream: bool,
+) -> urllib.request.Request:
+    payload = {
+        "model": model.strip(),
+        "instructions": instructions,
+        "input": input_items,
+        "max_output_tokens": max_output_tokens,
+        "store": False,
+        "stream": stream,
+    }
+    return urllib.request.Request(
+        API_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+
+def _result_from_body(body: dict[str, Any], text: str) -> ResponseResult:
+    usage = body.get("usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    return ResponseResult(
+        text=text,
+        response_id=body.get("id"),
+        input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+        output_tokens=output_tokens if isinstance(output_tokens, int) else None,
+    )
 
 
 def extract_output_text(body: dict[str, Any]) -> str:
