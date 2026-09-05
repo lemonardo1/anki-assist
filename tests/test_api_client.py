@@ -128,6 +128,12 @@ class ApiClientTests(unittest.TestCase):
                     cancel_event=cancelled,
                 )
 
+    def test_friendly_api_errors(self):
+        self.assertIn("API 키", api_client._friendly_http_error(401, "invalid"))
+        self.assertIn("한도", api_client._friendly_http_error(429, "limited"))
+        self.assertIn("일시적인 오류", api_client._friendly_http_error(503, "down"))
+        self.assertIn("detail", api_client._friendly_http_error(400, "detail"))
+
     def test_parses_fenced_edit_json_and_filters_unknown_fields(self):
         summary, updates = api_client.parse_edit_proposal(
             '```json\n{"summary":"정리", "updates":{"Front":"새 값", "Bad":"x"}}\n```',

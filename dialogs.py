@@ -9,6 +9,7 @@ from aqt.qt import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -16,6 +17,7 @@ from aqt.qt import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -24,18 +26,34 @@ from aqt.qt import (
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent: QWidget, config: dict, on_save: Callable[[dict], None]):
+    def __init__(
+        self,
+        parent: QWidget,
+        config: dict,
+        on_save: Callable[[dict], None],
+        environment_key_active: bool = False,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Anki Assist 설정")
         self.setMinimumWidth(470)
         self._config = config
         self._on_save = on_save
+        self._existing_key = str(config.get("api_key", ""))
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.key = QLineEdit(str(config.get("api_key", "")))
+        self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("sk-proj-…")
+        if environment_key_active:
+            self.key.setPlaceholderText("환경 변수 OPENAI_API_KEY 사용 중")
+        elif self._existing_key:
+            self.key.setPlaceholderText("저장된 키 있음 — 변경할 때만 입력")
+        else:
+            self.key.setPlaceholderText("sk-proj-…")
+        self.clear_key = QCheckBox("저장된 로컬 API 키 삭제")
+        self.clear_key.setEnabled(bool(self._existing_key))
+        self.clear_key.toggled.connect(self._toggle_clear_key)
+        self.key.textChanged.connect(self._key_changed)
         self.model = QLineEdit(str(config.get("model", "gpt-5-mini")))
         self.tokens = QSpinBox()
         self.tokens.setRange(128, 16000)
@@ -43,11 +61,18 @@ class SettingsDialog(QDialog):
         self.review_only = QCheckBox("리뷰 화면에서만 사이드바 표시")
         self.review_only.setChecked(bool(config.get("show_only_in_review", True)))
         form.addRow("OpenAI API 키", self.key)
+        form.addRow("", self.clear_key)
         form.addRow("모델", self.model)
         form.addRow("최대 출력 토큰", self.tokens)
         form.addRow("표시", self.review_only)
         layout.addLayout(form)
-        notice = QLabel("API 키는 Anki의 로컬 애드온 설정에 저장됩니다. 공유 컴퓨터에서는 사용하지 마세요.")
+        notice_text = (
+            "OPENAI_API_KEY 환경 변수가 로컬 설정보다 우선 사용됩니다. "
+            "아래에 새 키를 저장해도 환경 변수를 제거하기 전에는 사용되지 않습니다."
+            if environment_key_active
+            else "API 키는 Anki의 로컬 애드온 설정에 저장됩니다. 공유 컴퓨터에서는 사용하지 마세요."
+        )
+        notice = QLabel(notice_text)
         notice.setWordWrap(True)
         layout.addWidget(notice)
         buttons = QDialogButtonBox(
@@ -57,13 +82,27 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _toggle_clear_key(self, checked: bool) -> None:
+        self.key.setEnabled(not checked)
+
+    def _key_changed(self, text: str) -> None:
+        if text and self.clear_key.isChecked():
+            self.clear_key.setChecked(False)
+
     def _save(self) -> None:
         if not self.model.text().strip():
             QMessageBox.warning(self, "Anki Assist", "모델 이름을 입력해 주세요.")
             return
+        entered_key = self.key.text().strip()
+        if self.clear_key.isChecked():
+            api_key = ""
+        elif entered_key:
+            api_key = entered_key
+        else:
+            api_key = self._existing_key
         updated = dict(self._config)
         updated.update(
-            api_key=self.key.text().strip(),
+            api_key=api_key,
             model=self.model.text().strip(),
             max_output_tokens=self.tokens.value(),
             show_only_in_review=self.review_only.isChecked(),
@@ -186,7 +225,7 @@ class EditPreviewDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("AI 수정안 미리보기")
-        self.resize(720, 540)
+        self.resize(820, 620)
         self._on_apply = on_apply
         self._editors: dict[str, tuple[QCheckBox, QPlainTextEdit]] = {}
 
@@ -195,19 +234,47 @@ class EditPreviewDialog(QDialog):
         title.setTextFormat(Qt.TextFormat.PlainText)
         title.setWordWrap(True)
         layout.addWidget(title)
+
+        selection_row = QHBoxLayout()
+        select_all = QPushButton("전체 선택")
+        select_none = QPushButton("전체 해제")
+        select_all.clicked.connect(lambda: self._set_all_checked(True))
+        select_none.clicked.connect(lambda: self._set_all_checked(False))
+        selection_row.addWidget(select_all)
+        selection_row.addWidget(select_none)
+        selection_row.addStretch(1)
+        layout.addLayout(selection_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_body = QWidget()
+        scroll_layout = QVBoxLayout(scroll_body)
         for name, value in updates.items():
+            group = QGroupBox(name)
+            group_layout = QVBoxLayout(group)
             enabled = QCheckBox(f"{name} 필드 적용")
             enabled.setChecked(True)
-            layout.addWidget(enabled)
-            before = QLabel(f"기존: {original.get(name, '')}")
-            before.setTextFormat(Qt.TextFormat.PlainText)
-            before.setWordWrap(True)
-            before.setStyleSheet("color: palette(mid); padding-left: 6px;")
-            layout.addWidget(before)
+            group_layout.addWidget(enabled)
+            comparison = QHBoxLayout()
+            before_column = QVBoxLayout()
+            before_column.addWidget(QLabel("기존"))
+            before = QPlainTextEdit(original.get(name, ""))
+            before.setReadOnly(True)
+            before.setMinimumHeight(110)
+            before_column.addWidget(before)
+            after_column = QVBoxLayout()
+            after_column.addWidget(QLabel("AI 제안 — 적용 전 편집 가능"))
             edit = QPlainTextEdit(value)
-            edit.setMinimumHeight(90)
-            layout.addWidget(edit)
+            edit.setMinimumHeight(110)
+            after_column.addWidget(edit)
+            comparison.addLayout(before_column, 1)
+            comparison.addLayout(after_column, 1)
+            group_layout.addLayout(comparison)
+            scroll_layout.addWidget(group)
             self._editors[name] = (enabled, edit)
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_body)
+        layout.addWidget(scroll, 1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -215,6 +282,10 @@ class EditPreviewDialog(QDialog):
         buttons.accepted.connect(self._apply)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _set_all_checked(self, checked: bool) -> None:
+        for checkbox, _editor in self._editors.values():
+            checkbox.setChecked(checked)
 
     def _apply(self) -> None:
         selected = {

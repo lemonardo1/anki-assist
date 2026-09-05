@@ -16,9 +16,12 @@ from aqt.qt import (
     QComboBox,
     QDockWidget,
     QHBoxLayout,
+    QKeySequence,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QShortcut,
     QStackedWidget,
     QTabWidget,
     QTextBrowser,
@@ -118,6 +121,7 @@ class AssistDock(QDockWidget):
         status_row.addWidget(self.status_label, 1)
         status_row.addWidget(self.cancel_button)
         outer.addLayout(status_row)
+        self._setup_shortcuts(root)
         return root
 
     def _build_ask_tab(self) -> QWidget:
@@ -152,6 +156,11 @@ class AssistDock(QDockWidget):
         self.copy_button.setText("답변 복사")
         self.copy_button.setEnabled(False)
         self.copy_button.clicked.connect(self.copy_last_answer)
+        copy_menu = QMenu(self.copy_button)
+        copy_conversation = copy_menu.addAction("전체 대화 복사")
+        copy_conversation.triggered.connect(self.copy_conversation)
+        self.copy_button.setMenu(copy_menu)
+        self.copy_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.retry_button = QToolButton()
         self.retry_button.setText("재시도")
         self.retry_button.setToolTip("마지막 질문 다시 보내기")
@@ -188,6 +197,26 @@ class AssistDock(QDockWidget):
         layout.addWidget(self.edit_button)
         layout.addStretch(1)
         return page
+
+    def _setup_shortcuts(self, parent: QWidget) -> None:
+        self._panel_shortcuts = []
+        self.cancel_shortcut = QShortcut(QKeySequence("Escape"), parent)
+        self.cancel_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.cancel_shortcut.activated.connect(self.cancel_request)
+        self.cancel_shortcut.setEnabled(False)
+        self._panel_shortcuts.append(self.cancel_shortcut)
+
+        focus_shortcut = QShortcut(QKeySequence("Ctrl+L"), parent)
+        focus_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        focus_shortcut.activated.connect(self.focus_active_input)
+        self._panel_shortcuts.append(focus_shortcut)
+
+    def focus_active_input(self) -> None:
+        if self.tabs.currentIndex() == 1:
+            self.edit_prompt.setFocus()
+            return
+        editor = self.question if self._conversation_started else self.initial_question
+        editor.setFocus()
 
     def config(self) -> dict:
         return mw.addonManager.getConfig(__package__) or {}
@@ -403,6 +432,16 @@ class AssistDock(QDockWidget):
             QApplication.clipboard().setText(self._last_answer)
             self._set_status("마지막 AI 답변을 복사했습니다.", temporary=True)
 
+    def copy_conversation(self) -> None:
+        if not self._display_messages:
+            return
+        transcript = "\n\n".join(
+            f"{message.get('speaker', '')}:\n{message.get('text', '')}"
+            for message in self._display_messages
+        )
+        QApplication.clipboard().setText(transcript)
+        self._set_status("전체 대화를 복사했습니다.", temporary=True)
+
     def retry_last_question(self) -> None:
         if not self._last_question or self._busy:
             return
@@ -594,6 +633,7 @@ class AssistDock(QDockWidget):
 
     def _set_busy(self, busy: bool, status: str = "") -> None:
         self._busy = busy
+        self.cancel_shortcut.setEnabled(busy)
         self.send_button.setEnabled(not busy)
         self.edit_button.setEnabled(not busy)
         self.retry_button.setEnabled(not busy and bool(self._last_question))
@@ -673,7 +713,12 @@ class AssistDock(QDockWidget):
         dialog.destroyed.connect(lambda: self._dialogs.remove(dialog) if dialog in self._dialogs else None)
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self, self.config(), self.save_config)
+        dialog = SettingsDialog(
+            self,
+            self.config(),
+            self.save_config,
+            environment_key_active=bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+        )
         self._keep_dialog(dialog)
         dialog.show()
 

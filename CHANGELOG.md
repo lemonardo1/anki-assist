@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-09-05
+
+- Keep stored API keys out of the settings input; preserve or delete them explicitly.
+- Show whether `OPENAI_API_KEY` is active without exposing its value.
+- Add a menu for copying the entire visible conversation.
+- Add `⌘+L`/`Ctrl+L` to focus the active prompt and `Esc` to cancel a request.
+- Present friendlier messages for authentication, permission, rate-limit, and server errors.
+- Make the card-edit preview scrollable with side-by-side before/after fields.
+- Add select-all and clear-all controls for proposed field updates.
+
 ## 0.3.0 — 2026-09-04
 
 - Stream follow-up answers into the conversation as they are generated.

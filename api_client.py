@@ -60,7 +60,7 @@ def create_response(
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = _http_error_message(error)
-        raise OpenAIError(f"OpenAI API 오류 ({error.code}): {detail}") from error
+        raise OpenAIError(_friendly_http_error(error.code, detail)) from error
     except urllib.error.URLError as error:
         raise OpenAIError(f"네트워크 연결에 실패했습니다: {error.reason}") from error
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -121,7 +121,7 @@ def create_streaming_response(
                     raise OpenAIError(str(message or "OpenAI 응답 생성에 실패했습니다."))
     except urllib.error.HTTPError as error:
         detail = _http_error_message(error)
-        raise OpenAIError(f"OpenAI API 오류 ({error.code}): {detail}") from error
+        raise OpenAIError(_friendly_http_error(error.code, detail)) from error
     except urllib.error.URLError as error:
         raise OpenAIError(f"네트워크 연결에 실패했습니다: {error.reason}") from error
     except UnicodeDecodeError as error:
@@ -263,3 +263,15 @@ def _http_error_message(error: urllib.error.HTTPError) -> str:
     except Exception:
         pass
     return error.reason or "요청 실패"
+
+
+def _friendly_http_error(status: int, detail: str) -> str:
+    if status == 401:
+        return "API 키가 유효하지 않습니다. Anki Assist 설정에서 키를 확인해 주세요."
+    if status == 403:
+        return "이 API 키에는 요청 권한이 없습니다. OpenAI 프로젝트 권한을 확인해 주세요."
+    if status == 429:
+        return "OpenAI 요청 한도 또는 크레딧을 확인해 주세요. 잠시 후 다시 시도할 수도 있습니다."
+    if status >= 500:
+        return "OpenAI 서버에서 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    return f"OpenAI API 오류 ({status}): {detail}"
